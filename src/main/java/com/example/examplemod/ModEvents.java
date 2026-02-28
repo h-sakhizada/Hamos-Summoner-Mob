@@ -1,5 +1,6 @@
 package com.example.examplemod;
 
+import com.example.examplemod.entity.BodyguardEntity;
 import com.example.examplemod.entity.SummonerEntity;
 import com.example.examplemod.registry.ModEntities;
 
@@ -28,6 +29,12 @@ public class ModEvents {
         event.put(
                 ModEntities.SUMMONER.get(),
                 SummonerEntity.createAttributes().build()
+        );
+
+        // Attach the BodyguardEntity attribute set (health, movement speed, etc.) to its EntityType
+        event.put(
+                ModEntities.BODYGUARD.get(),
+                BodyguardEntity.createAttributes().build()
         );
     }
 }
