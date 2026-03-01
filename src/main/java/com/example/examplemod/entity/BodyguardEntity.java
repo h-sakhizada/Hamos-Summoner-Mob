@@ -36,7 +36,7 @@ import java.util.UUID;
  * Bodyguard entity that protects a Summoner.
  *
  * Fixes included:
- * - Uses Summoner recall token to force ALL guards to return together after Summoner takes 10 hearts of damage.
+ * - Uses Summoner retaliate token to make ALL guards charge the attacker when Summoner takes 10 hearts of player damage.
  *
  * Version: 1.0.0
  * Comments:
@@ -63,6 +63,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     // NBT keys used to persist combat state across world reloads
     private static final String NBT_MODE = "BodyguardMode";
     private static final String NBT_LAST_TARGET = "BodyguardLastTarget";
+    private static final String NBT_RETALIATE_COOLDOWN = "BodyguardRetaliateCooldown";
 
     // Side values stored in NBT (left/right relative to summoner facing direction)
     private static final String SIDE_LEFT = "left";
@@ -73,6 +74,9 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
 
     // Aggro / detection tuning
     private static final double AGGRO_RADIUS = 10.0;
+
+    // Retaliate cooldown (7 seconds at 20 TPS)
+    private static final int RETALIATE_COOLDOWN_TICKS = 140;
 
     // Charge tuning
     private static final int CHARGE_DURATION_TICKS = 60;
@@ -142,11 +146,14 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     // Attack animation cycling (server-side)
     private int attackAnimTicksLeft = 0;
 
-    // Recall token tracking (server-side)
-    private int lastSeenRecallToken = 0;
+    // Retaliate token tracking (server-side)
+    private int lastSeenRetaliateToken = 0;
 
     // Charge token tracking (server-side)
     private int lastSeenChargeToken = 0;
+
+    // Retaliate cooldown remaining ticks (prevents charge spam after retaliate)
+    private int retaliateCooldownTicksLeft = 0;
 
 
     /**
@@ -416,6 +423,9 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         if (this.getTarget() != null) {
             tag.putUUID(NBT_LAST_TARGET, this.getTarget().getUUID());
         }
+
+        // Persist retaliate cooldown so it survives reload
+        tag.putInt(NBT_RETALIATE_COOLDOWN, this.retaliateCooldownTicksLeft);
     }
 
     /**
@@ -444,6 +454,11 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
             if (e instanceof Player p) {
                 this.setTarget(p);
             }
+        }
+
+        // Restore retaliate cooldown
+        if (tag.contains(NBT_RETALIATE_COOLDOWN)) {
+            this.retaliateCooldownTicksLeft = tag.getInt(NBT_RETALIATE_COOLDOWN);
         }
     }
 
@@ -492,8 +507,13 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         // Server-only logic (clients should not simulate AI)
         if (this.level().isClientSide) return;
 
-        // Shared recall event: forces RETURN for all guards at the same time
-        this.tickRecallTokenSync();
+        // Decrement retaliate cooldown each tick
+        if (this.retaliateCooldownTicksLeft > 0) {
+            this.retaliateCooldownTicksLeft--;
+        }
+
+        // Shared retaliate event: charges the attacker when summoner takes enough player damage
+        this.tickRetaliateTokenSync();
 
         // Shared charge event: starts charge for both guards together when Summoner triggers it
         this.tickChargeTokenSync();
@@ -506,41 +526,69 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
 
         // Reacquire target after reload if we are in combat mode
         this.tickReacquireTargetIfNeeded();
+
+        // If in MELEE with no target, fall back to RETURN
+        this.tickMeleeFallbackToReturn();
     }
 
 
     /**
-     * Checks the owning Summoner's recall token and forces RETURN when it changes.
-     *
-     * This ensures:
-     * - Both guards react to the same shared event.
-     * - Guards ignore the player while returning (prevents jitter / indecision movement).
-     * - GUARD mode only resumes after formation is restored.
+     * If in MELEE mode with no target (player died or left), transition to RETURN.
      *
      * Version: 1.0.0
      * Comments:
      */
-    private void tickRecallTokenSync() {
+    private void tickMeleeFallbackToReturn() {
+        if (this.mode != GuardMode.MELEE) return;
+        if (this.getTarget() instanceof Player) return;
+
+        this.clearCombatState();
+        this.setMode(GuardMode.RETURN);
+    }
+
+    /**
+     * Checks the owning Summoner's retaliate token and charges the attacker when it changes.
+     *
+     * This ensures:
+     * - Both guards react to the same shared event.
+     * - Guards charge the player who damaged the summoner past the threshold.
+     * - Guards already mid-charge are NOT interrupted.
+     *
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void tickRetaliateTokenSync() {
 
         SummonerEntity summoner = this.getOwningSummoner();
         if (summoner == null) return;
 
-        int token = summoner.getBodyguardRecallToken();
+        int token = summoner.getBodyguardRetaliateToken();
 
-        // If token changed, summoner triggered a recall event
-        if (token != this.lastSeenRecallToken) {
-            this.lastSeenRecallToken = token;
+        // No new retaliate signal
+        if (token == this.lastSeenRetaliateToken) return;
 
-            // Hard-stop all combat behaviors immediately
-            this.clearCombatState();
+        // Consume token immediately (unlike charge token which defers)
+        this.lastSeenRetaliateToken = token;
 
-            // Enter RETURN mode (ignore player and run back)
-            this.setMode(GuardMode.RETURN);
+        // Must be fully active (not rising)
+        if (!this.isFullyActive()) return;
 
-            // Ensure charge must be re-armed properly after returning
-            this.chargeAvailable = false;
-            this.playerWasInAggroRadius = false;
-        }
+        // Do NOT interrupt an existing charge
+        if (this.getSyncedMode() == GuardMode.CHARGE) return;
+
+        // Must not be on cooldown
+        if (this.retaliateCooldownTicksLeft > 0) return;
+
+        // Resolve the attacker from summoner
+        UUID attackerUUID = summoner.getRetaliateAttackerUUID();
+        if (attackerUUID == null) return;
+        if (!(this.level() instanceof ServerLevel serverLevel)) return;
+        Entity attackerEntity = serverLevel.getEntity(attackerUUID);
+        if (!(attackerEntity instanceof Player attackerPlayer)) return;
+
+        // Clear current combat state and charge the attacker
+        this.clearCombatState();
+        this.startCharge(attackerPlayer);
     }
 
     /**
@@ -564,6 +612,9 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         if (token == this.lastSeenChargeToken) return;
 
         // ---- Eligibility gates (do NOT consume token unless we pass) ----
+
+        // Do not start a proximity charge while retaliate cooldown is active
+        if (this.retaliateCooldownTicksLeft > 0) return;
 
         // Must be fully active (not rising)
         if (!this.isFullyActive()) return;
@@ -856,6 +907,9 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         SummonerEntity summoner = this.getOwningSummoner();
         if (summoner == null) return;
 
+        // Do not re-arm while retaliate cooldown is active
+        if (this.retaliateCooldownTicksLeft > 0) return;
+
         // Only re-arm while in GUARD and properly formed beside the summoner
         if (!this.isFullyActive()) return;
         if (this.getSyncedMode() != GuardMode.GUARD) return;
@@ -951,7 +1005,10 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         // Charge cannot be used again until the guard fully reforms in GUARD mode
         this.chargeAvailable = false;
 
-        // Always go into melee after a charge (unless recall later forces RETURN)
+        // Start retaliate cooldown to prevent charge spam
+        this.retaliateCooldownTicksLeft = RETALIATE_COOLDOWN_TICKS;
+
+        // Always go into melee after a charge (unless retaliate later forces another charge)
         this.setMode(GuardMode.MELEE);
     }
 
