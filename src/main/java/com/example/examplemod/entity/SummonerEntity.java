@@ -44,7 +44,7 @@ import java.util.UUID;
  * - During casting, movement is rooted.
  * - Spawns a summoning circle + mist particles.
  * - Spawns 6 rising minions; 2 are bodyguards and 4 are zombies.
- * - Tracks damage taken centrally and emits a recall token when threshold is reached so all bodyguards return.
+ * - Tracks player damage centrally and emits a retaliate token when threshold is reached so all bodyguards charge the attacker.
  *
  * AI Behavior update:
  * - Summoner behaves like a "stand-still skeleton":
@@ -119,7 +119,7 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
 
 
     // Shared bodyguard recall tuning (10 hearts = 20 damage)
-    private static final float BODYGUARD_RECALL_DAMAGE_THRESHOLD = 20.0F;
+    private static final float BODYGUARD_RETALIATE_DAMAGE_THRESHOLD = 20.0F;
 
     // Aggro radius for starting a synchronized bodyguard charge
     private static final double BODYGUARD_AGGRO_RADIUS = 10.0;
@@ -139,17 +139,20 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
     // UUIDs of currently summoned mobs (used for rising + enabling them)
     private final List<UUID> summonedIds = new ArrayList<>();
 
-    // Centralized damage accumulation for triggering bodyguard recall
-    private float recallDamageAccumulated = 0.0F;
+    // Centralized player damage accumulation for triggering bodyguard retaliate
+    private float retaliateDamageAccumulated = 0.0F;
 
-    // Token increments whenever the recall threshold is reached (guards compare last-seen token)
-    private int bodyguardRecallToken = 0;
+    // Token increments whenever the retaliate threshold is reached (guards compare last-seen token)
+    private int bodyguardRetaliateToken = 0;
 
     // Shared charge token increments whenever a player enters the aggro radius
     private int bodyguardChargeToken = 0;
 
     // Tracks whether a player was previously in the summoner aggro radius
     private boolean playerWasInAggroRadius = false;
+
+    // UUID of the player who last triggered the retaliate threshold
+    private UUID retaliateAttackerUUID = null;
 
     /**
      * Constructs a new SummonerEntity instance.
@@ -372,22 +375,33 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
     }
 
     /**
-     * Returns the current bodyguard recall token.
+     * Returns the current bodyguard retaliate token.
      *
-     * Bodyguards compare this token to their last-seen value; if it changes, they return to guard stance.
+     * Bodyguards compare this token to their last-seen value; if it changes, they charge the attacker.
      *
      * @return int - The current recall token value.
      * Version: 1.0.0
      * Comments:
      */
-    public int getBodyguardRecallToken() {
-        return this.bodyguardRecallToken;
+    public int getBodyguardRetaliateToken() {
+        return this.bodyguardRetaliateToken;
+    }
+
+    /**
+     * Returns the UUID of the player who last triggered the retaliate threshold.
+     *
+     * @return UUID - The attacker's UUID, or null if no attacker recorded.
+     * Version: 1.0.0
+     * Comments:
+     */
+    public UUID getRetaliateAttackerUUID() {
+        return this.retaliateAttackerUUID;
     }
 
     /**
      * Applies damage immunity during the first-ever summon cast.
      *
-     * Also centralizes damage tracking after damage is actually applied so bodyguards can be recalled reliably.
+     * Also centralizes player damage tracking and emits a retaliate token so bodyguards charge the attacker.
      *
      * @param source DamageSource source - The incoming damage source.
      * @param amount float amount - The incoming damage amount.
@@ -407,12 +421,15 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
         boolean applied = super.hurt(source, amount);
         if (!applied) return false;
 
-        // Accumulate damage centrally and emit a recall token when threshold is reached
-        this.recallDamageAccumulated += amount;
+        // Accumulate player damage and emit a retaliate token when threshold is reached
+        if (source.getEntity() instanceof Player attackerPlayer) {
+            this.retaliateDamageAccumulated += amount;
 
-        if (this.recallDamageAccumulated >= BODYGUARD_RECALL_DAMAGE_THRESHOLD) {
-            this.recallDamageAccumulated = 0.0F;
-            this.bodyguardRecallToken++;
+            if (this.retaliateDamageAccumulated >= BODYGUARD_RETALIATE_DAMAGE_THRESHOLD) {
+                this.retaliateAttackerUUID = attackerPlayer.getUUID();
+                this.retaliateDamageAccumulated = 0.0F;
+                this.bodyguardRetaliateToken++;
+            }
         }
 
         return true;
