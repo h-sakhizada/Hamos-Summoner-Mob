@@ -32,4 +32,16 @@ public class ModItems {
                             new Item.Properties()
                     )
             );
+
+    // Spawn egg item for the Bodyguard entity (colors are placeholder values)
+    public static final RegistryObject<Item> BODYGUARD_SPAWN_EGG =
+            ITEMS.register(
+                    "bodyguard_spawn_egg",
+                    () -> new ForgeSpawnEggItem(
+                            ModEntities.BODYGUARD,
+                            0x1E1E1E, // Primary egg color (near-black)
+                            0x6A2CA0, // Secondary egg color (deep purple)
+                            new Item.Properties()
+                    )
+            );
 }

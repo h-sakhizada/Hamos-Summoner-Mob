@@ -7,6 +7,13 @@ import net.minecraft.resources.ResourceLocation;
 
 import software.bernie.geckolib.model.GeoModel;
 
+import net.minecraft.util.Mth;
+import software.bernie.geckolib.constant.DataTickets;
+import software.bernie.geckolib.core.animation.AnimationState;
+import software.bernie.geckolib.core.object.DataTicket;
+import software.bernie.geckolib.model.data.EntityModelData;
+import software.bernie.geckolib.core.animatable.model.CoreGeoBone;
+
 /**
  * Defines the GeckoLib model, texture, and animation resources used by the SummonerEntity.
  *
@@ -67,5 +74,26 @@ public class SummonerModel extends GeoModel<SummonerEntity> {
                 ExampleMod.MODID,
                 "animations/summoner_animations.json"
         );
+    }
+
+
+    @Override
+    public void setCustomAnimations(SummonerEntity animatable, long instanceId, AnimationState<SummonerEntity> animationState) {
+        super.setCustomAnimations(animatable, instanceId, animationState);
+
+        // This contains headYaw/headPitch that MC calculates for the entity each tick
+        EntityModelData data = animationState.getData(DataTickets.ENTITY_MODEL_DATA);
+        if (data == null) return;
+
+        // IMPORTANT: bone name must match your geo.json bone name (usually "head")
+        CoreGeoBone head = this.getAnimationProcessor().getBone("head");
+        if (head == null) return;
+
+        // GeckoLib expects radians. MC gives degrees.
+        float yawRadians = data.netHeadYaw() * Mth.DEG_TO_RAD;
+        float pitchRadians = data.headPitch() * Mth.DEG_TO_RAD;
+
+        head.setRotY(yawRadians);     // left/right look
+        head.setRotX(pitchRadians);   // up/down look
     }
 }

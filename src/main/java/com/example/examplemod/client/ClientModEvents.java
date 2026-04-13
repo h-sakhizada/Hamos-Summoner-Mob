@@ -1,7 +1,9 @@
 package com.example.examplemod.client;
 
 import com.example.examplemod.ExampleMod;
+import com.example.examplemod.client.renderer.BodyguardRenderer;
 import com.example.examplemod.client.renderer.SummonerRenderer;
+
 import com.example.examplemod.registry.ModEntities;
 
 import net.minecraftforge.api.distmarker.Dist;
@@ -33,9 +35,12 @@ public class ClientModEvents {
     public static void registerRenderers(EntityRenderersEvent.RegisterRenderers event) {
 
         // Register the SummonerEntity renderer
+        event.registerEntityRenderer(ModEntities.SUMMONER.get(), SummonerRenderer::new);
+
+        // Register the BodyguardEntity renderer
         event.registerEntityRenderer(
-                ModEntities.SUMMONER.get(),
-                SummonerRenderer::new
+                ModEntities.BODYGUARD.get(),
+                BodyguardRenderer::new
         );
     }
 }

@@ -27,9 +27,10 @@ public class ModCreativeTabs {
     @SubscribeEvent
     public static void buildCreativeTabContents(BuildCreativeModeTabContentsEvent event) {
 
-        // Put the Summoner spawn egg into the vanilla "Spawn Eggs" creative tab
+        // Put spawn eggs into the vanilla "Spawn Eggs" creative tab (creative-only access)
         if (event.getTabKey() == CreativeModeTabs.SPAWN_EGGS) {
             event.accept(ModItems.SUMMONER_SPAWN_EGG.get());
+            event.accept(ModItems.BODYGUARD_SPAWN_EGG.get());
         }
     }
 }
