@@ -7,6 +7,12 @@ import net.minecraft.resources.ResourceLocation;
 
 import software.bernie.geckolib.model.GeoModel;
 
+import net.minecraft.util.Mth;
+import software.bernie.geckolib.constant.DataTickets;
+import software.bernie.geckolib.core.animation.AnimationState;
+import software.bernie.geckolib.model.data.EntityModelData;
+import software.bernie.geckolib.core.animatable.model.CoreGeoBone;
+
 /**
  * Defines the GeckoLib model, texture, and animation resources used by the BodyguardEntity.
  *
@@ -61,5 +67,22 @@ public class BodyguardModel extends GeoModel<BodyguardEntity> {
                 ExampleMod.MODID,
                 "animations/bodyguard_animations.json"
         );
+    }
+
+    @Override
+    public void setCustomAnimations(BodyguardEntity animatable, long instanceId, AnimationState<BodyguardEntity> animationState) {
+        super.setCustomAnimations(animatable, instanceId, animationState);
+
+        EntityModelData data = animationState.getData(DataTickets.ENTITY_MODEL_DATA);
+        if (data == null) return;
+
+        CoreGeoBone head = this.getAnimationProcessor().getBone("head");
+        if (head == null) return;
+
+        float yawRadians = data.netHeadYaw() * Mth.DEG_TO_RAD;
+        float pitchRadians = data.headPitch() * Mth.DEG_TO_RAD;
+
+        head.setRotY(yawRadians);
+        head.setRotX(pitchRadians);
     }
 }

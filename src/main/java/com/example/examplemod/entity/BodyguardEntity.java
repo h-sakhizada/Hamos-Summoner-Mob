@@ -1,5 +1,6 @@
 package com.example.examplemod.entity;
 
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
@@ -26,7 +27,6 @@ import software.bernie.geckolib.core.animation.AnimationController;
 import software.bernie.geckolib.core.animation.RawAnimation;
 import software.bernie.geckolib.core.object.PlayState;
 import software.bernie.geckolib.util.GeckoLibUtil;
-import net.minecraft.nbt.CompoundTag;
 
 import java.util.EnumSet;
 import java.util.List;
@@ -35,8 +35,16 @@ import java.util.UUID;
 /**
  * Bodyguard entity that protects a Summoner.
  *
- * Fixes included:
- * - Uses Summoner recall token to force ALL guards to return together after Summoner takes 10 hearts of damage.
+ * Core behavior:
+ * - GUARD: stays beside the summoner in guard stance
+ * - CHARGE: rushes the player with a short burst attack
+ * - MELEE: continues normal chase + melee after charge
+ * - RETURN: ignores player and runs back to the summoner
+ *
+ * Special behavior:
+ * - If the summoner takes enough damage while the player is still within the 10-block radius,
+ *   the guards immediately re-charge the player instead of just returning.
+ * - If there is no owning summoner, the bodyguard becomes a permanent melee attacker.
  *
  * Version: 1.0.0
  * Comments:
@@ -60,16 +68,19 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     private static final String NBT_OWNER_UUID = "SummonerOwner";
     private static final String NBT_SIDE = "SummonerSide";
 
-    // NBT keys used to persist combat state across world reloads
+    // NBT keys used to persist combat state across reloads
     private static final String NBT_MODE = "BodyguardMode";
     private static final String NBT_LAST_TARGET = "BodyguardLastTarget";
 
-    // Side values stored in NBT (left/right relative to summoner facing direction)
+    // Side values stored in NBT (left/right relative to the summoner)
     private static final String SIDE_LEFT = "left";
 
     // Guard formation tuning
     private static final double GUARD_SIDE_OFFSET = 1.8;
-    private static final double GUARD_STOP_DISTANCE = 1.2;
+    private static final double GUARD_READY_DISTANCE = 0.45;
+    // Matches the summoning circle radius — a guard is "in formation" when it is
+    // this close to the summoner and has finished navigating.
+    private static final double FORMATION_RADIUS = 5.0;
 
     // Aggro / detection tuning
     private static final double AGGRO_RADIUS = 10.0;
@@ -77,7 +88,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     // Charge tuning
     private static final int CHARGE_DURATION_TICKS = 60;
     private static final double CHARGE_SPEED_MULTIPLIER = 1.4;
-    private static final int CHARGE_STEER_UPDATE_EVERY_TICKS = 3;
+    private static final int CHARGE_STEER_UPDATE_EVERY_TICKS = 6;
     private static final double CHARGE_TURN_LERP = 0.10;
 
     // One-time impact damage tuning for charge
@@ -89,14 +100,13 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     private static final int MELEE_ATTACK_INTERVAL_TICKS = 20;
     private static final double MELEE_REACH = 2.75;
 
-    // Melee animation timing: 0.33s at 20 TPS ≈ 7 ticks
+    // Melee animation timing
     private static final int MELEE_HIT_DELAY_TICKS = 3;
 
-    // True for 1 tick after starting an attack so the controller can reset ONCE
+    // True for 1 tick after starting an attack so the controller can reset once
     private boolean attackAnimationJustStarted = false;
 
-
-    // Movement modifier used during charge (2.5x => MULTIPLY_TOTAL +1.5)
+    // Movement modifier used during charge
     private static final UUID CHARGE_SPEED_UUID =
             UUID.fromString("2e6b1e49-0c0a-4c2c-8e32-fb7d9eaf2f4d");
     private static final AttributeModifier CHARGE_SPEED_MOD =
@@ -125,7 +135,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         RETURN
     }
 
-
     // Current mode (server-side)
     private GuardMode mode = GuardMode.GUARD;
 
@@ -139,15 +148,12 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     private boolean chargeAvailable = true;
     private boolean playerWasInAggroRadius = false;
 
-    // Attack animation cycling (server-side)
+    // Attack animation timing
     private int attackAnimTicksLeft = 0;
 
-    // Recall token tracking (server-side)
+    // Shared token tracking
     private int lastSeenRecallToken = 0;
-
-    // Charge token tracking (server-side)
     private int lastSeenChargeToken = 0;
-
 
     /**
      * Constructs a new BodyguardEntity instance.
@@ -186,50 +192,11 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         this.entityData.define(DATA_CHARGING, false);
         this.entityData.define(DATA_ATTACKING, false);
         this.entityData.define(DATA_ATTACK_INDEX, 0);
-
-        // Sync mode so the client animation controller sees the real server state
         this.entityData.define(DATA_MODE, GuardMode.GUARD.ordinal());
     }
 
     /**
-     * Returns the guard's synced mode value for client-side animation decisions.
-     *
-     * @return GuardMode - The current mode as seen by SynchedEntityData.
-     * Version: 1.0.0
-     * Comments:
-     */
-    private GuardMode getSyncedMode() {
-        int idx = this.entityData.get(DATA_MODE);
-
-        // Clamp to valid enum range (prevents crashes if bad data ever occurs)
-        if (idx < 0 || idx >= GuardMode.values().length) {
-            idx = GuardMode.GUARD.ordinal();
-        }
-
-        return GuardMode.values()[idx];
-    }
-
-    /**
-     * Sets the guard's mode on the server AND syncs it to clients.
-     *
-     * IMPORTANT:
-     * - Always use this instead of assigning this.mode directly.
-     *
-     * @param newMode GuardMode newMode - The new behavior mode to enter.
-     * Version: 1.0.0
-     * Comments:
-     */
-    private void setMode(GuardMode newMode) {
-        this.mode = newMode;
-        this.entityData.set(DATA_MODE, newMode.ordinal());
-    }
-
-    /**
      * Registers AI goals that define the entity’s behavior.
-     *
-     * IMPORTANT FIX:
-     * - Do NOT call super.registerGoals() because Zombie default goals can override guard/return logic.
-     * - Add a mode-gated target selector so the guard only targets players during CHARGE/MELEE.
      *
      * Version: 1.0.0
      * Comments:
@@ -237,7 +204,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     @Override
     protected void registerGoals() {
 
-        // RETURN must be first so it overrides everything else when active
+        // RETURN must override all combat behavior
         this.goalSelector.addGoal(0, new ReturnToSummonerGoal(this));
 
         // Charge movement while in CHARGE mode
@@ -249,10 +216,10 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         // Formation movement while in GUARD mode
         this.goalSelector.addGoal(3, new StayBesideSummonerGoal(this));
 
-        // Visual awareness (cosmetic)
+        // Visual awareness
         this.goalSelector.addGoal(4, new LookAtPlayerGoal(this, Player.class, 10.0F));
 
-        // Target players ONLY when fighting (prevents "one hit then return" while in GUARD/RETURN)
+        // Target players only during combat modes
         this.targetSelector.addGoal(1, new net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal<>(this, Player.class, true) {
 
             /**
@@ -264,7 +231,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
              */
             @Override
             public boolean canUse() {
-                return (BodyguardEntity.this.getSyncedMode() == GuardMode.CHARGE || BodyguardEntity.this.getSyncedMode() == GuardMode.MELEE)
+                return (BodyguardEntity.this.mode == GuardMode.CHARGE || BodyguardEntity.this.mode == GuardMode.MELEE)
                         && super.canUse();
             }
 
@@ -277,7 +244,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
              */
             @Override
             public boolean canContinueToUse() {
-                return (BodyguardEntity.this.getSyncedMode() == GuardMode.CHARGE || BodyguardEntity.this.getSyncedMode() == GuardMode.MELEE)
+                return (BodyguardEntity.this.mode == GuardMode.CHARGE || BodyguardEntity.this.mode == GuardMode.MELEE)
                         && super.canContinueToUse();
             }
         });
@@ -286,10 +253,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Registers GeckoLib animation controllers for this entity.
      *
-     * Update:
-     * - guarding_animation only plays when the guard is in GUARD mode and not moving.
-     * - otherwise, idle_animation plays when not moving/attacking/charging.
-     *
      * @param controllers AnimatableManager.ControllerRegistrar controllers - Controller registry used by GeckoLib.
      * Version: 1.0.0
      * Comments:
@@ -297,7 +260,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     @Override
     public void registerControllers(AnimatableManager.ControllerRegistrar controllers) {
 
-        // Main controller that decides which animation should be active
         AnimationController<BodyguardEntity> controller =
                 new AnimationController<>(this, "controller", 5, state -> {
 
@@ -308,7 +270,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
                     if (this.isCharging()) {
                         target = RawAnimation.begin().thenLoop("charging_animation");
 
-                        // Attack animation window plays next (PLAY_ONCE)
+                        // Attack animation window plays next
                     } else if (this.isAttacking()) {
 
                         String animName = switch (this.getAttackIndex()) {
@@ -317,9 +279,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
                             default -> "attacking_animation1";
                         };
 
-                        // IMPORTANT FIX:
-                        // Only reset the animation ONCE when the attack begins.
-                        // If we reset every tick, the animation restarts repeatedly and never finishes.
                         if (this.attackAnimationJustStarted) {
                             c.forceAnimationReset();
                             this.attackAnimationJustStarted = false;
@@ -331,20 +290,15 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
                     } else if (state.isMoving()) {
                         target = RawAnimation.begin().thenLoop("walking_animation");
 
-                        // Only show guarding stance when the guard is actually in GUARD mode
+                        // Guarding animation only in actual GUARD mode
                     } else if (this.getSyncedMode() == GuardMode.GUARD) {
                         target = RawAnimation.begin().thenLoop("guarding_animation");
-                        System.out.println("guarding");
 
-                        System.out.println(this.getSyncedMode());
-
-                        // Otherwise, default to idle when standing still (RETURN/MELEE/etc.)
+                        // Otherwise use idle when standing still in other modes
                     } else {
                         target = RawAnimation.begin().thenLoop("idle_animation");
-                        System.out.println("standing still");
                     }
 
-                    // Avoid re-applying the same animation every tick (prevents constant resets)
                     if (c.getCurrentRawAnimation() == null || !c.getCurrentRawAnimation().equals(target)) {
                         c.setAnimation(target);
                     }
@@ -352,17 +306,14 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
                     return PlayState.CONTINUE;
                 });
 
-        // Ensures an animation is set immediately for already-spawned entities on world load
         controller.setAnimation(RawAnimation.begin().thenLoop("idle_animation"));
-
-        // Register the controller with GeckoLib
         controllers.add(controller);
     }
-
 
     /**
      * Creates the attribute set for the BodyguardEntity.
      *
+     * @return AttributeSupplier.Builder - Builder containing the entity's attributes to be registered.
      * Version: 1.0.0
      * Comments:
      */
@@ -370,7 +321,20 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         return Zombie.createAttributes()
                 .add(Attributes.MAX_HEALTH, 60.0D)
                 .add(Attributes.MOVEMENT_SPEED, 0.22D)
-                .add(Attributes.ATTACK_DAMAGE, MELEE_DAMAGE);
+                .add(Attributes.ATTACK_DAMAGE, MELEE_DAMAGE)
+                .add(Attributes.FOLLOW_RANGE, 32.0D);
+    }
+
+    /**
+     * Prevents this entity from burning in sunlight.
+     *
+     * @return boolean - Always false to indicate the entity should not burn this tick.
+     * Version: 1.0.0
+     * Comments:
+     */
+    @Override
+    protected boolean isSunBurnTick() {
+        return false;
     }
 
     /**
@@ -387,18 +351,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     }
 
     /**
-     * Prevents this entity from burning in sunlight.
-     *
-     * Version: 1.0.0
-     * Comments:
-     */
-    @Override
-    protected boolean isSunBurnTick() {
-        return false;
-    }
-
-
-    /**
      * Saves persistent bodyguard state to NBT so combat can resume after reload.
      *
      * @param tag CompoundTag tag - The NBT tag being written for this entity.
@@ -409,10 +361,8 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     public void addAdditionalSaveData(CompoundTag tag) {
         super.addAdditionalSaveData(tag);
 
-        // Persist current mode so we don't default back to GUARD after reload
         tag.putInt(NBT_MODE, this.getSyncedMode().ordinal());
 
-        // Persist last target so MELEE/CHARGE can resume after reload
         if (this.getTarget() != null) {
             tag.putUUID(NBT_LAST_TARGET, this.getTarget().getUUID());
         }
@@ -429,7 +379,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     public void readAdditionalSaveData(CompoundTag tag) {
         super.readAdditionalSaveData(tag);
 
-        // Restore mode (clamp to safe range)
         if (tag.contains(NBT_MODE)) {
             int idx = tag.getInt(NBT_MODE);
             if (idx < 0 || idx >= GuardMode.values().length) {
@@ -438,7 +387,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
             this.setMode(GuardMode.values()[idx]);
         }
 
-        // Restore target if possible; if not available yet, tick() will reacquire
         if (tag.hasUUID(NBT_LAST_TARGET) && (this.level() instanceof ServerLevel serverLevel)) {
             Entity e = serverLevel.getEntity(tag.getUUID(NBT_LAST_TARGET));
             if (e instanceof Player p) {
@@ -448,39 +396,12 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     }
 
     /**
-     * Reacquires a player target after reload if the guard is in a combat mode but has no target.
-     *
-     * Version: 1.0.0
-     * Comments:
-     */
-    private void tickReacquireTargetIfNeeded() {
-
-        // Only server decides targets
-        if (this.level().isClientSide) return;
-
-        // If we're not fighting, don't auto-pick targets
-        if (this.mode != GuardMode.MELEE && this.mode != GuardMode.CHARGE) return;
-
-        // If target already exists, nothing to do
-        if (this.getTarget() instanceof Player) return;
-
-        SummonerEntity summoner = this.getOwningSummoner();
-        if (summoner == null) return;
-
-        // Prefer "near summoner" logic so behavior stays consistent
-        Player target = this.findClosestPlayerNearSummoner(summoner);
-        if (target != null) {
-            this.setTarget(target);
-        }
-    }
-
-    /**
      * Main per-tick update for this entity.
      *
-     * Key fixes:
-     * - Recall now enters RETURN mode (ignores player and runs back to summoner).
-     * - Charge trigger is read from the Summoner (shared token) so both guards charge together.
-     * - GUARD is only entered once formation is restored.
+     * Updated behavior:
+     * - If there is no owning Summoner, the bodyguard permanently enters melee mode
+     *   and attacks the nearest player on its own.
+     * - If it does have a Summoner, it continues to use shared recall/charge logic.
      *
      * Version: 1.0.0
      * Comments:
@@ -489,33 +410,108 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     public void tick() {
         super.tick();
 
-        // Server-only logic (clients should not simulate AI)
         if (this.level().isClientSide) return;
 
-        // Shared recall event: forces RETURN for all guards at the same time
+        SummonerEntity summoner = this.getOwningSummoner();
+
+        // If there is no owning summoner, this guard becomes a permanent melee attacker
+        if (summoner == null) {
+
+            if (this.mode != GuardMode.MELEE) {
+                this.setMode(GuardMode.MELEE);
+            }
+
+            if (!(this.getTarget() instanceof Player)) {
+                Player nearest = this.findClosestPlayerToSelf();
+                if (nearest != null) {
+                    this.setTarget(nearest);
+                }
+            }
+
+            this.tickAttackAnimationWindow();
+            return;
+        }
+
+        // Shared recall event: either punish nearby attacker with a re-charge,
+        // or return to the Summoner if no one is nearby
         this.tickRecallTokenSync();
 
         // Shared charge event: starts charge for both guards together when Summoner triggers it
         this.tickChargeTokenSync();
 
-        // Re-arm charge ONLY while properly formed in GUARD mode
+        // Re-arm charge only while properly formed in GUARD mode
         this.tickChargeRearmRules();
-
-        // Attack animation window timer
-        this.tickAttackAnimationWindow();
 
         // Reacquire target after reload if we are in combat mode
         this.tickReacquireTargetIfNeeded();
+
+        // Attack animation window timer
+        this.tickAttackAnimationWindow();
     }
 
+    /**
+     * Returns the guard's synced mode value for client-side animation decisions.
+     *
+     * @return GuardMode - The current mode as seen by SynchedEntityData.
+     * Version: 1.0.0
+     * Comments:
+     */
+    private GuardMode getSyncedMode() {
+        int idx = this.entityData.get(DATA_MODE);
+
+        if (idx < 0 || idx >= GuardMode.values().length) {
+            idx = GuardMode.GUARD.ordinal();
+        }
+
+        return GuardMode.values()[idx];
+    }
 
     /**
-     * Checks the owning Summoner's recall token and forces RETURN when it changes.
+     * Returns whether this bodyguard is currently in GUARD mode.
      *
-     * This ensures:
-     * - Both guards react to the same shared event.
-     * - Guards ignore the player while returning (prevents jitter / indecision movement).
-     * - GUARD mode only resumes after formation is restored.
+     * @return boolean - True if the guard is in GUARD mode.
+     * Version: 1.0.0
+     * Comments:
+     */
+    public boolean isGuardModeActive() {
+        return this.getSyncedMode() == GuardMode.GUARD;
+    }
+
+    /**
+     * Returns whether this bodyguard is currently in formation beside its owning summoner.
+     *
+     * @return boolean - True if the guard is in formation for its owner.
+     * Version: 1.0.0
+     * Comments:
+     */
+    public boolean isInFormationForOwner() {
+        SummonerEntity summoner = this.getOwningSummoner();
+        if (summoner == null) return false;
+
+        return this.isInFormation(summoner);
+    }
+
+    /**
+     * Sets the guard's mode on the server AND syncs it to clients.
+     *
+     * @param newMode GuardMode newMode - The new behavior mode to enter.
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void setMode(GuardMode newMode) {
+        this.mode = newMode;
+        this.entityData.set(DATA_MODE, newMode.ordinal());
+    }
+
+    /**
+     * Checks the owning Summoner's recall token and reacts based on whether the player
+     * is still inside the Summoner's 10-block protection radius.
+     *
+     * Updated behavior:
+     * - If recall triggers AND a player is still within the Summoner's aggro radius,
+     *   the guards immediately charge that player again and then continue melee.
+     * - If recall triggers AND no player is within that radius,
+     *   the guards return to the Summoner as normal.
      *
      * Version: 1.0.0
      * Comments:
@@ -527,28 +523,36 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
 
         int token = summoner.getBodyguardRecallToken();
 
-        // If token changed, summoner triggered a recall event
-        if (token != this.lastSeenRecallToken) {
-            this.lastSeenRecallToken = token;
+        if (token == this.lastSeenRecallToken) return;
 
-            // Hard-stop all combat behaviors immediately
+        this.lastSeenRecallToken = token;
+
+        Player nearbyThreat = this.findClosestPlayerNearSummoner(summoner);
+
+        if (nearbyThreat != null) {
+
+            // If the attacker is still close to the Summoner, punish them immediately
             this.clearCombatState();
-
-            // Enter RETURN mode (ignore player and run back)
-            this.setMode(GuardMode.RETURN);
-
-            // Ensure charge must be re-armed properly after returning
             this.chargeAvailable = false;
-            this.playerWasInAggroRadius = false;
+            this.playerWasInAggroRadius = true;
+            this.startCharge(nearbyThreat);
+            return;
         }
+
+        // If no player is near the Summoner, return to formation normally
+        this.clearCombatState();
+        this.setMode(GuardMode.RETURN);
+
+        this.chargeAvailable = false;
+        this.playerWasInAggroRadius = false;
     }
 
     /**
      * Reads the Summoner's shared "charge token" and starts a charge when it changes.
      *
-     * IMPORTANT FIX:
-     * - Do NOT "consume" (store) the new token until the guard is actually eligible to charge.
-     * - This prevents missing the charge signal during rising / formation settling.
+     * IMPORTANT:
+     * - This only applies when the guard has an owning Summoner.
+     * - Orphaned guards do not use shared charge logic; they stay in permanent melee mode instead.
      *
      * Version: 1.0.0
      * Comments:
@@ -563,42 +567,73 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         // No new charge signal
         if (token == this.lastSeenChargeToken) return;
 
-        // ---- Eligibility gates (do NOT consume token unless we pass) ----
-
-        // Must be fully active (not rising)
+        // Must be fully active
         if (!this.isFullyActive()) return;
 
-        // Must be in GUARD mode (RETURN/MELEE/CHARGE should not start a new charge)
-        if (this.getSyncedMode() != GuardMode.GUARD) return;
+        // Must be in GUARD mode
+        if (this.mode != GuardMode.GUARD) return;
 
         // Must be in formation beside summoner
         if (!this.isInFormation(summoner)) return;
 
-        // Must have charge available (re-armed)
+        // Must have charge available
         if (!this.chargeAvailable) return;
 
-        // Find the player near the summoner as the charge target
         Player target = this.findClosestPlayerNearSummoner(summoner);
         if (target == null) return;
 
-        // ---- Consume token ONLY now (we are actually charging) ----
         this.lastSeenChargeToken = token;
-
-        // Start the charge
         this.startCharge(target);
     }
 
+    /**
+     * Re-arms charge availability while the guard is safely in GUARD mode and in formation.
+     *
+     * Charge should only become available again when the guard has returned to formation.
+     *
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void tickChargeRearmRules() {
 
+        SummonerEntity summoner = this.getOwningSummoner();
+        if (summoner == null) return;
 
+        if (!this.isFullyActive()) return;
+        if (this.mode != GuardMode.GUARD) return;
+        if (!this.isInFormation(summoner)) return;
 
-    // -----------------------------
-    // Everything below this point is your existing bodyguard logic
-    // (no functional changes here beyond recall fix).
-    // -----------------------------
+        Player p = this.findClosestPlayerNearSummoner(summoner);
+        if (p == null) {
+            this.chargeAvailable = true;
+        }
+    }
+
+    /**
+     * Reacquires a player target after reload if the guard is in a combat mode but has no target.
+     *
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void tickReacquireTargetIfNeeded() {
+
+        if (this.level().isClientSide) return;
+        if (this.mode != GuardMode.MELEE && this.mode != GuardMode.CHARGE) return;
+        if (this.getTarget() instanceof Player) return;
+
+        SummonerEntity summoner = this.getOwningSummoner();
+        if (summoner == null) return;
+
+        Player target = this.findClosestPlayerNearSummoner(summoner);
+        if (target != null) {
+            this.setTarget(target);
+        }
+    }
 
     /**
      * Returns whether the bodyguard is currently charging.
      *
+     * @return boolean - True if charging, otherwise false.
      * Version: 1.0.0
      * Comments:
      */
@@ -609,6 +644,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Sets the charging state and synchronizes it to clients.
      *
+     * @param value boolean value - True to enable charging state, false to disable it.
      * Version: 1.0.0
      * Comments:
      */
@@ -619,6 +655,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Returns whether the bodyguard is currently playing an attack animation window.
      *
+     * @return boolean - True if attacking animation flag is active.
      * Version: 1.0.0
      * Comments:
      */
@@ -629,6 +666,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Sets the attack animation window flag.
      *
+     * @param value boolean value - True to enable attack animation, false to disable it.
      * Version: 1.0.0
      * Comments:
      */
@@ -639,6 +677,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Returns the current attack animation index (0..2).
      *
+     * @return int - Current attack animation index.
      * Version: 1.0.0
      * Comments:
      */
@@ -649,6 +688,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Sets the current attack animation index.
      *
+     * @param index int index - Attack animation index to use.
      * Version: 1.0.0
      * Comments:
      */
@@ -697,6 +737,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Returns whether this bodyguard is fully active (not in rising phase).
      *
+     * @return boolean - True if the guard is active.
      * Version: 1.0.0
      * Comments:
      */
@@ -707,6 +748,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Attempts to locate and return the owning Summoner entity from stored NBT.
      *
+     * @return SummonerEntity - The owner summoner if found, otherwise null.
      * Version: 1.0.0
      * Comments:
      */
@@ -727,6 +769,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Returns whether this bodyguard is assigned to the left side.
      *
+     * @return boolean - True if the stored side is left.
      * Version: 1.0.0
      * Comments:
      */
@@ -738,21 +781,20 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Calculates desired guard position beside summoner.
      *
+     * This version keeps the formation at fixed world offsets beside the summoner.
+     *
+     * @param summoner SummonerEntity summoner - The owning summoner.
+     * @return Vec3 - Desired formation position.
      * Version: 1.0.0
      * Comments:
      */
     private Vec3 getDesiredGuardPosition(SummonerEntity summoner) {
 
-        double yawRad = Math.toRadians(summoner.getYRot());
-
-        double rightX = -Math.sin(yawRad);
-        double rightZ = Math.cos(yawRad);
-
         double sideSign = this.isLeftSide() ? -1.0 : 1.0;
 
-        double targetX = summoner.getX() + (rightX * GUARD_SIDE_OFFSET * sideSign);
+        double targetX = summoner.getX() + (GUARD_SIDE_OFFSET * sideSign);
         double targetY = summoner.getY();
-        double targetZ = summoner.getZ() + (rightZ * GUARD_SIDE_OFFSET * sideSign);
+        double targetZ = summoner.getZ();
 
         return new Vec3(targetX, targetY, targetZ);
     }
@@ -760,20 +802,25 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Returns whether the bodyguard is currently in formation beside the Summoner.
      *
+     * @param summoner SummonerEntity summoner - The owning summoner.
+     * @return boolean - True if the guard is close enough to its formation point.
      * Version: 1.0.0
      * Comments:
      */
     private boolean isInFormation(SummonerEntity summoner) {
 
-        Vec3 desired = this.getDesiredGuardPosition(summoner);
-        double dist = this.distanceToSqr(desired.x, desired.y, desired.z);
+        double distToSummoner = this.distanceToSqr(summoner);
+        boolean withinRadius = distToSummoner <= (FORMATION_RADIUS * FORMATION_RADIUS);
+        boolean notMoving = this.getNavigation().isDone();
 
-        return dist <= (GUARD_STOP_DISTANCE * GUARD_STOP_DISTANCE);
+        return withinRadius && notMoving;
     }
 
     /**
      * Finds the closest player within AGGRO_RADIUS of the summoner (true radius check).
      *
+     * @param summoner SummonerEntity summoner - The summoner to scan around.
+     * @return Player - Closest player found within radius, or null if none exist in range.
      * Version: 1.0.0
      * Comments:
      */
@@ -785,7 +832,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
 
         Player closest = null;
         double bestDist = Double.MAX_VALUE;
-
         double maxDistSqr = AGGRO_RADIUS * AGGRO_RADIUS;
 
         for (Player p : players) {
@@ -802,107 +848,45 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     }
 
     /**
-     * Bundle for target state near summoner.
+     * Finds the closest player to this bodyguard within its follow range.
      *
+     * This is used when the bodyguard has no owning summoner, so it can operate
+     * in permanent melee mode on its own.
+     *
+     * @return Player - The closest player found, or null if none are nearby.
      * Version: 1.0.0
      * Comments:
      */
-    private static class LivingTargetState {
+    private Player findClosestPlayerToSelf() {
 
-        private final Player targetPlayer;
-        private final boolean anyPlayerInRadius;
+        double range = 32.0D;
 
-        /**
-         * Constructs a target state object.
-         *
-         * @param targetPlayer Player targetPlayer - Closest player, nullable.
-         * @param anyPlayerInRadius boolean anyPlayerInRadius - True if any player is inside radius.
-         * Version: 1.0.0
-         * Comments:
-         */
-        private LivingTargetState(Player targetPlayer, boolean anyPlayerInRadius) {
-            this.targetPlayer = targetPlayer;
-            this.anyPlayerInRadius = anyPlayerInRadius;
-        }
-    }
-
-    /**
-     * Returns current player-in-radius state around summoner.
-     *
-     * Version: 1.0.0
-     * Comments:
-     */
-    private LivingTargetState getCurrentTargetState() {
-
-        SummonerEntity summoner = this.getOwningSummoner();
-        if (summoner == null) return new LivingTargetState(null, false);
-
-        Player closest = this.findClosestPlayerNearSummoner(summoner);
-        boolean any = (closest != null);
-
-        return new LivingTargetState(closest, any);
-    }
-
-    /**
-     * Re-arms charge availability while the guard is safely in GUARD mode and in formation.
-     *
-     * Charge should only become available again when the guard has returned to formation.
-     *
-     * Version: 1.0.0
-     * Comments:
-     */
-    private void tickChargeRearmRules() {
-
-        SummonerEntity summoner = this.getOwningSummoner();
-        if (summoner == null) return;
-
-        // Only re-arm while in GUARD and properly formed beside the summoner
-        if (!this.isFullyActive()) return;
-        if (this.getSyncedMode() != GuardMode.GUARD) return;
-        if (!this.isInFormation(summoner)) return;
-
-        // Only re-arm if no player is currently in aggro radius around the summoner
-        Player p = this.findClosestPlayerNearSummoner(summoner);
-        if (p == null) {
-            this.chargeAvailable = true;
-        }
-    }
-
-    /**
-     * Clears any active combat state (charge speed, charge flags, target, navigation).
-     *
-     * Used when switching into RETURN mode so the guard does not jitter between attack and return.
-     *
-     * Version: 1.0.0
-     * Comments:
-     */
-    private void clearCombatState() {
-
-        // Clear target and stop movement immediately
-        this.setTarget(null);
-        this.getNavigation().stop();
-
-        // Cancel charge flags and remove charge speed modifier if present
-        this.setCharging(false);
-        this.chargeTicksLeft = 0;
-        this.chargeSteerCooldown = 0;
-        this.chargeImpactApplied = false;
-
-        var speedAttr = this.getAttribute(Attributes.MOVEMENT_SPEED);
-        if (speedAttr != null && speedAttr.hasModifier(CHARGE_SPEED_MOD)) {
-            speedAttr.removeModifier(CHARGE_SPEED_MOD);
+        if (this.getAttribute(Attributes.FOLLOW_RANGE) != null) {
+            range = this.getAttributeValue(Attributes.FOLLOW_RANGE);
         }
 
-        // Cancel pending melee animation windows
-        this.setAttacking(false);
-        this.attackAnimTicksLeft = 0;
+        AABB box = this.getBoundingBox().inflate(range);
+        List<Player> players = this.level().getEntitiesOfClass(Player.class, box);
+        if (players.isEmpty()) return null;
+
+        Player closest = null;
+        double bestDist = Double.MAX_VALUE;
+
+        for (Player p : players) {
+            double d = this.distanceToSqr(p);
+            if (d < bestDist) {
+                bestDist = d;
+                closest = p;
+            }
+        }
+
+        return closest;
     }
-
-
 
     /**
      * Starts a charge toward a target.
      *
+     * @param player Player player - The target player being charged.
      * Version: 1.0.0
      * Comments:
      */
@@ -929,9 +913,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Ends charge and transitions into melee.
      *
-     * IMPORTANT FIX:
-     * - After charge completes, guards remain in MELEE unless recall triggers RETURN.
-     *
      * Version: 1.0.0
      * Comments:
      */
@@ -951,14 +932,15 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         // Charge cannot be used again until the guard fully reforms in GUARD mode
         this.chargeAvailable = false;
 
-        // Always go into melee after a charge (unless recall later forces RETURN)
+        // Always go into melee after a charge
         this.setMode(GuardMode.MELEE);
     }
-
 
     /**
      * Applies one-time charge impact damage.
      *
+     * @param target Player target - Player being hit.
+     * @return boolean - True if impact damage was applied this tick.
      * Version: 1.0.0
      * Comments:
      */
@@ -985,10 +967,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
      */
     private void startMeleeAttackAnimation() {
 
-        // Existing logic you already have (setting attacking flag, index, ticks, etc.)
         this.setAttacking(true);
-
-        // IMPORTANT: controller should only reset once per attack start
         this.attackAnimationJustStarted = true;
 
         this.advanceAttackIndex();
@@ -998,11 +977,39 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     /**
      * Applies melee hit damage.
      *
+     * @param target Player target - Player being damaged.
      * Version: 1.0.0
      * Comments:
      */
     private void applyMeleeHitDamage(Player target) {
         target.hurt(this.damageSources().mobAttack(this), MELEE_DAMAGE);
+    }
+
+    /**
+     * Clears any active combat state (charge speed, charge flags, target, navigation).
+     *
+     * Used when switching into RETURN mode so the guard does not jitter between attack and return.
+     *
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void clearCombatState() {
+
+        this.setTarget(null);
+        this.getNavigation().stop();
+
+        this.setCharging(false);
+        this.chargeTicksLeft = 0;
+        this.chargeSteerCooldown = 0;
+        this.chargeImpactApplied = false;
+
+        var speedAttr = this.getAttribute(Attributes.MOVEMENT_SPEED);
+        if (speedAttr != null && speedAttr.hasModifier(CHARGE_SPEED_MOD)) {
+            speedAttr.removeModifier(CHARGE_SPEED_MOD);
+        }
+
+        this.setAttacking(false);
+        this.attackAnimTicksLeft = 0;
     }
 
     /**
@@ -1030,6 +1037,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         /**
          * Determines whether the goal can run.
          *
+         * @return boolean - True while in CHARGE mode with a player target.
          * Version: 1.0.0
          * Comments:
          */
@@ -1041,6 +1049,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         /**
          * Continues while charge conditions hold.
          *
+         * @return boolean - True while charge remains valid.
          * Version: 1.0.0
          * Comments:
          */
@@ -1084,7 +1093,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
 
             Vec3 ahead = this.guard.position().add(this.guard.chargeDir.scale(10.0));
             this.guard.getNavigation().moveTo(ahead.x, ahead.y, ahead.z, 1.25D);
-            this.guard.getLookControl().setLookAt(ahead.x, ahead.y + 1.0, ahead.z);
+            this.guard.getLookControl().setLookAt(ahead.x, ahead.y + 1.0D, ahead.z);
         }
 
         /**
@@ -1130,6 +1139,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         /**
          * Determines whether melee can run.
          *
+         * @return boolean - True while in MELEE mode with a player target.
          * Version: 1.0.0
          * Comments:
          */
@@ -1141,10 +1151,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         /**
          * Continues while melee conditions hold.
          *
-         * IMPORTANT FIX:
-         * - Do NOT require getOwningSummoner() != null here, because temporary lookup failures
-         *   can prematurely end the melee goal and interrupt attacks.
-         *
          * @return boolean - True while mode is MELEE and target is a player.
          * Version: 1.0.0
          * Comments:
@@ -1153,7 +1159,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         public boolean canContinueToUse() {
             return this.canUse();
         }
-
 
         /**
          * Initializes timers when melee starts.
@@ -1179,19 +1184,9 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
 
             if (!(this.guard.getTarget() instanceof Player target)) return;
 
-//            if(this.guard.mode == GuardMode.MELEE)
-//            {
-//                System.out.println("guardmode MELEE");
-//            }else
-//            {
-//                System.out.println("guardmode NOT MELEE");
-//            }
-
             if (this.pendingHitTicksLeft > 0) {
 
-                //this.guard.getNavigation().stop();
                 this.guard.getLookControl().setLookAt(target, 30.0F, 30.0F);
-
                 this.pendingHitTicksLeft--;
 
                 if (this.pendingHitTicksLeft <= 0) {
@@ -1211,7 +1206,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
                     this.attackCooldown = MELEE_ATTACK_INTERVAL_TICKS;
                 }
 
-                System.out.println("attacking");
                 return;
             }
 
@@ -1225,7 +1219,6 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
             double reachSqr = MELEE_REACH * MELEE_REACH;
             if (this.attackCooldown <= 0 && this.guard.distanceToSqr(target) <= reachSqr) {
 
-                //this.guard.getNavigation().stop();
                 this.guard.startMeleeAttackAnimation();
 
                 this.pendingHitTarget = target;
@@ -1236,28 +1229,27 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         /**
          * Cleanup on melee stop.
          *
-         * IMPORTANT FIX:
+         * IMPORTANT:
          * - Do NOT change mode here.
-         *   Mode must remain MELEE unless recall triggers RETURN or other explicit state change occurs.
+         * - Mode must remain MELEE unless recall triggers RETURN or another explicit state change occurs.
          *
          * Version: 1.0.0
          * Comments:
          */
         @Override
         public void stop() {
-
-            // Stop navigation so we don't slide after combat ends
-            //this.guard.getNavigation().stop();
-
-            // Clear any pending delayed hit
             this.pendingHitTicksLeft = 0;
             this.pendingHitTarget = null;
         }
-
     }
 
     /**
      * Formation goal while in GUARD mode.
+     *
+     * The guard will not stop moving until isInFormation() returns true.
+     * moveTo is only re-issued when the navigator finishes (completed or failed)
+     * or when the summoner has moved far enough to change the target, so the
+     * path is not reset every tick and can actually complete.
      *
      * Version: 1.0.0
      * Comments:
@@ -1265,6 +1257,12 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
     private static class StayBesideSummonerGoal extends Goal {
 
         private final BodyguardEntity guard;
+
+        // Re-issue moveTo when the formation target shifts at least this far (0.5 blocks)
+        private static final double REPATH_MOVE_THRESHOLD_SQR = 0.25;
+
+        // Last formation position we issued a moveTo for
+        private Vec3 lastTargetPos = null;
 
         /**
          * Constructs formation goal.
@@ -1281,6 +1279,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         /**
          * Determines whether formation can run.
          *
+         * @return boolean - True while in GUARD mode with an owner.`
          * Version: 1.0.0
          * Comments:
          */
@@ -1292,6 +1291,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         /**
          * Continues while formation conditions hold.
          *
+         * @return boolean - True while in GUARD mode with an owner.
          * Version: 1.0.0
          * Comments:
          */
@@ -1301,7 +1301,22 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
         }
 
         /**
+         * Resets navigation state when the goal becomes active.
+         *
+         * Version: 1.0.0
+         * Comments:
+         */
+        @Override
+        public void start() {
+            this.lastTargetPos = null;
+        }
+
+        /**
          * Tick handler for formation movement.
+         *
+         * Only issues moveTo when the navigator is done or the target moved —
+         * this lets each path complete instead of being reset every tick.
+         * The guard never stops moving until isInFormation() is satisfied.
          *
          * Version: 1.0.0
          * Comments:
@@ -1314,16 +1329,25 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
 
             Vec3 target = this.guard.getDesiredGuardPosition(summoner);
 
-            double dist = this.guard.distanceToSqr(target.x, target.y, target.z);
-
-            if (dist > (GUARD_STOP_DISTANCE * GUARD_STOP_DISTANCE)) {
-                this.guard.getNavigation().moveTo(target.x, target.y, target.z, 1.15D);
-            } else {
+            if (this.guard.isInFormation(summoner)) {
+                // Reached formation — stop and record position
                 this.guard.getNavigation().stop();
+                this.lastTargetPos = target;
+            } else {
+                // Only repath when the navigator has finished (completed or failed)
+                // OR when the summoner moved far enough that the target changed
+                boolean navDone = this.guard.getNavigation().isDone();
+                boolean targetMoved = this.lastTargetPos == null
+                        || this.lastTargetPos.distanceToSqr(target) > REPATH_MOVE_THRESHOLD_SQR;
+
+                if (navDone || targetMoved) {
+                    this.guard.getNavigation().moveTo(target.x, target.y, target.z, 1.15D);
+                    this.lastTargetPos = target;
+                }
             }
 
-            //this.guard.setYRot(summoner.getYRot());
-            //this.guard.setYHeadRot(summoner.getYHeadRot());
+            this.guard.setYRot(summoner.getYRot());
+            this.guard.setYHeadRot(summoner.getYHeadRot());
         }
     }
 
@@ -1387,34 +1411,28 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
             SummonerEntity summoner = this.guard.getOwningSummoner();
             if (summoner == null) return;
 
-            // Ignore player entirely: clear target and focus on summoner
+            // Ignore player entirely while returning
             this.guard.setTarget(null);
 
-            // Hard-stop any leftover attack animation flags while returning
+            // Clear any leftover combat animation flags
             this.guard.setCharging(false);
             this.guard.setAttacking(false);
 
-            Vec3 desired = this.guard.getDesiredGuardPosition(summoner);
-
-            double distSqr = this.guard.distanceToSqr(desired.x, desired.y, desired.z);
-
-            // Move back quickly until close enough
-            if (distSqr > (GUARD_STOP_DISTANCE * GUARD_STOP_DISTANCE)) {
-                this.guard.getNavigation().moveTo(desired.x, desired.y, desired.z, 1.35D);
-            } else {
-                // Formation restored: enter GUARD mode
+            // Switch to GUARD as soon as navigation finishes and guard is back in formation.
+            // Uses isInFormationForOwner() (5-block radius)
+            if (this.guard.isInFormationForOwner()) {
                 this.guard.getNavigation().stop();
                 this.guard.setMode(GuardMode.GUARD);
-                System.out.println("Setting mode to GUARD here");
-
-                // Reset aggro memory so charge won't instantly fire unless Summoner triggers again
                 this.guard.playerWasInAggroRadius = false;
+                return;
             }
 
-            // Face the same direction as summoner while returning
-            //this.guard.setYRot(summoner.getYRot());
-            //this.guard.setYHeadRot(summoner.getYHeadRot());
+            // Only issue moveTo when the current path has finished (succeeded or failed).
+            // Re-issuing it every tick was resetting the path before it could complete.
+            if (this.guard.getNavigation().isDone()) {
+                Vec3 desired = this.guard.getDesiredGuardPosition(summoner);
+                this.guard.getNavigation().moveTo(desired.x, desired.y, desired.z, 1.35D);
+            }
         }
     }
-
 }

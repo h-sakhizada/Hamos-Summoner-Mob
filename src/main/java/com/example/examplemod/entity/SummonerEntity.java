@@ -10,7 +10,6 @@ import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.Goal;
-import net.minecraft.world.entity.ai.goal.LookAtPlayerGoal;
 import net.minecraft.world.entity.ai.goal.RandomStrollGoal;
 import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
 import net.minecraft.world.entity.monster.Skeleton;
@@ -35,6 +34,11 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.UUID;
+
+import net.minecraft.core.particles.DustParticleOptions;
+import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.phys.AABB;
+import org.joml.Vector3f;
 
 /**
  * Summoner entity that performs a ritual cast and summons minions.
@@ -85,7 +89,7 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
     private static final double RISE_DEPTH = 2.0;
 
     // Respawn timing (10 seconds)
-    private static final int RESPAWN_DELAY_TICKS = 2000;
+    private static final int RESPAWN_DELAY_TICKS = 20000;
 
     // Movement root modifier used to freeze horizontal movement while casting
     private static final UUID CAST_ROOT_UUID =
@@ -98,24 +102,46 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
                     AttributeModifier.Operation.MULTIPLY_TOTAL
             );
 
-    // Summoner follow / spacing tuning (hysteresis style)
-    private static final double FOLLOW_STOP_DISTANCE = 12.0;     // "in range" distance where summoner stops
-    private static final double FOLLOW_RESUME_BUFFER = 5.0;      // must move 5 blocks farther to resume movement
-    private static final double FOLLOW_START_DISTANCE = FOLLOW_STOP_DISTANCE + FOLLOW_RESUME_BUFFER; // 17 blocks
-    private static final double TOO_CLOSE_DISTANCE = 8.0;        // optional back-off distance
-    private static final double FOLLOW_SPEED = 1.05D;
+    // --------------------
+    // Force field tuning
+    // --------------------
 
+    // Force field size (5 block diameter = 2.5 radius)
+    private static final double FORCEFIELD_RADIUS = 5D;
+
+    // Vertical offset so the dome starts slightly above the ground
+    private static final double FORCEFIELD_BASE_Y_OFFSET = 0.05D;
+
+    // Particle density controls (increase for denser dome)
+    private static final int FORCEFIELD_LATITUDE_STEPS = 10;
+    private static final int FORCEFIELD_LONGITUDE_STEPS = 28;
+
+    // Particle appearance controls
+    private static final float FORCEFIELD_PARTICLE_SIZE = 1.0F;
+    private static final Vector3f FORCEFIELD_PARTICLE_COLOR = new Vector3f(1.0F, 1.0F, 1.0F);
+
+    // How often the dome particles refresh (1 = every tick, 2 = every other tick, etc.)
+    private static final int FORCEFIELD_PARTICLE_REFRESH_TICKS = 2;
+
+    // Movement threshold used to decide whether the summoner is "standing still"
+    private static final double FORCEFIELD_STILL_SPEED_THRESHOLD = 0.0025D;
 
     // How far away the summoner can "attack" from (standing still once in range)
     private static final double SUMMONER_ATTACK_RANGE = 24.0;
     // Extra buffer so it doesn't micro-move when you're near the boundary
-    private static final double SUMMONER_ATTACK_RANGE_BUFFER = 3.0;
+    private static final double SUMMONER_ATTACK_RANGE_BUFFER = 6.0;
     // How far away the summoner will pursue a target (used by FOLLOW_RANGE attribute)
     private static final double SUMMONER_PURSUE_RANGE = 40.0;
     // Navigation speed while closing distance
     private static final double SUMMONER_APPROACH_SPEED = 1.05D;
     // If LOS breaks, how long (ticks) we keep trying before forcing a pathing refresh behavior
     private static final int SUMMONER_LOS_FORGET_TICKS = 40;
+
+    // How often we allow a full path recalculation while approaching (prevents jittery micro-steps)
+    private static final int SUMMONER_REPATH_INTERVAL_TICKS = 10;
+
+    // How far the target must move (in blocks) before we force a repath sooner
+    private static final double SUMMONER_REPATH_TARGET_MOVE_THRESHOLD = 2.0;
 
 
     // Shared bodyguard recall tuning (10 hearts = 20 damage)
@@ -150,6 +176,7 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
 
     // Tracks whether a player was previously in the summoner aggro radius
     private boolean playerWasInAggroRadius = false;
+
 
     /**
      * Constructs a new SummonerEntity instance.
@@ -199,13 +226,16 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
         this.goalSelector.addGoal(3, new RandomStrollOnlyWhenNoTargetGoal(this, 0.8D));
 
         // Visual awareness
-        this.goalSelector.addGoal(4, new LookAtPlayerGoal(this, Player.class, 10.0F));
+        //this.goalSelector.addGoal(4, new LookAtPlayerGoal(this, Player.class, 10.0F));
 
-        // Targets players
+        // Faster target refresh so getTarget() doesn't "drop" for a second
         this.targetSelector.addGoal(1, new NearestAttackableTargetGoal<>(
                 this,
                 Player.class,
-                true
+                1,      // <--- check every tick (or try 2/3 if you want)
+                true,   // mustSee
+                false,  // mustReach
+                null
         ));
     }
 
@@ -323,6 +353,8 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
         return this.bodyguardChargeToken;
     }
 
+
+
     /**
      * Main per-tick update for this entity.
      *
@@ -342,6 +374,9 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
 
         this.updateCastRoot();
         this.tickRespawnCountdown();
+
+        // Runs the bodyguard force field when both guards are ready and the summoner is stationary
+        this.tickBodyguardForceField();
 
         if (this.casting) {
             this.tickSummoning();
@@ -370,6 +405,8 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
         this.entityData.set(DATA_CASTING, value);
         this.casting = value;
     }
+
+
 
     /**
      * Returns the current bodyguard recall token.
@@ -417,6 +454,7 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
 
         return true;
     }
+
 
     /**
      * Disables knockback during the first-ever summon cast.
@@ -752,6 +790,267 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
         );
     }
 
+
+    /**
+     * Runs the bodyguard force field logic for this tick.
+     *
+     * The force field activates only when:
+     * - The summoner is not casting
+     * - The summoner is standing still
+     * - Both bodyguards exist
+     * - Both bodyguards are in GUARD mode
+     * - Both bodyguards are in formation
+     *
+     * When active:
+     * - A half-sphere particle dome is rendered from the summoner
+     * - Projectiles inside the dome have their velocity set to zero
+     *
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void tickBodyguardForceField() {
+        if (!(this.level() instanceof ServerLevel serverLevel)) return;
+        if (!this.shouldActivateBodyguardForceField(serverLevel)) return;
+
+        // Refresh dome particles at the configured interval
+        if (this.tickCount % FORCEFIELD_PARTICLE_REFRESH_TICKS == 0) {
+            this.spawnBodyguardForceFieldParticles(serverLevel);
+        }
+
+        // Stop all projectiles inside the dome
+        this.stopProjectilesInsideForceField(serverLevel);
+    }
+
+    /**
+     * Returns whether the bodyguard force field should currently be active.
+     *
+     * @param serverLevel ServerLevel serverLevel - The current server world.
+     * @return boolean - True if the shield should be active this tick.
+     * Version: 1.0.0
+     * Comments:
+     */
+    private boolean shouldActivateBodyguardForceField(ServerLevel serverLevel) {
+
+        // Do not overlap with casting visuals/behavior
+        if (this.isCasting()) return false;
+
+        // Summoner must be standing still
+        if (this.isMovingForForceField()) return false;
+
+        int readyBodyguards = 0;
+
+        // Check all currently tracked summoned entities
+        for (UUID id : this.summonedIds) {
+            Entity entity = serverLevel.getEntity(id);
+
+            if (entity instanceof BodyguardEntity bodyguard) {
+
+                // Count only bodyguards that are guarding and in formation
+                if (bodyguard.isGuardModeActive() && bodyguard.isInFormationForOwner()) {
+
+                    readyBodyguards++;
+                }
+            }
+        }
+        // Require both bodyguards
+        return readyBodyguards >= 2;
+    }
+
+    /**
+     * Returns whether the summoner is moving enough that the force field should be disabled.
+     *
+     * IMPORTANT FIX:
+     * - Do NOT rely on Navigation#isDone() here, because the summoner can remain visually still
+     *   while the navigation path is still considered active after combat movement.
+     * - Use actual horizontal movement only.
+     *
+     * @return boolean - True if the summoner is currently moving.
+     * Version: 1.0.0
+     * Comments:
+     */
+    private boolean isMovingForForceField() {
+
+        // Horizontal velocity only
+        Vec3 motion = this.getDeltaMovement();
+        double horizontalSpeedSqr = (motion.x * motion.x) + (motion.z * motion.z);
+
+        // Also check actual position change from last tick for safety
+        double dx = this.getX() - this.xo;
+        double dz = this.getZ() - this.zo;
+        double movedHorizontallySqr = (dx * dx) + (dz * dz);
+
+        return horizontalSpeedSqr > FORCEFIELD_STILL_SPEED_THRESHOLD
+                || movedHorizontallySqr > FORCEFIELD_STILL_SPEED_THRESHOLD;
+    }
+
+    /**
+     * Spawns the half-sphere force field particle dome centered on the summoner.
+     *
+     * The dome is a white hemisphere with configurable density and particle size.
+     *
+     * @param serverLevel ServerLevel serverLevel - The current server world.
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void spawnBodyguardForceFieldParticles(ServerLevel serverLevel) {
+
+        double centerX = this.getX();
+        double centerY = this.getY() + FORCEFIELD_BASE_Y_OFFSET;
+        double centerZ = this.getZ();
+
+        DustParticleOptions particle = new DustParticleOptions(
+                FORCEFIELD_PARTICLE_COLOR,
+                FORCEFIELD_PARTICLE_SIZE
+        );
+
+        // Build a hemisphere using horizontal rings from base -> top
+        for (int lat = 0; lat <= FORCEFIELD_LATITUDE_STEPS; lat++) {
+
+            double phi = (Math.PI / 2.0D) * (lat / (double) FORCEFIELD_LATITUDE_STEPS);
+
+            double ringRadius = FORCEFIELD_RADIUS * Math.cos(phi);
+            double y = centerY + FORCEFIELD_RADIUS * Math.sin(phi);
+
+            for (int lon = 0; lon < FORCEFIELD_LONGITUDE_STEPS; lon++) {
+
+                double theta = (Math.PI * 2.0D) * (lon / (double) FORCEFIELD_LONGITUDE_STEPS);
+
+                double x = centerX + ringRadius * Math.cos(theta);
+                double z = centerZ + ringRadius * Math.sin(theta);
+
+                serverLevel.sendParticles(
+                        particle,
+                        x, y, z,
+                        1,
+                        0.0D, 0.0D, 0.0D,
+                        0.0D
+                );
+            }
+        }
+    }
+
+    /**
+     * Deflects all projectile velocity inside the active force field dome.
+     *
+     * Updated behavior:
+     * - Projectiles bounce away from the shield surface instead of freezing.
+     * - A small upward push is added so they arc/fall to the ground more naturally.
+     * - Speed is reduced so the result feels more like a shield deflection than a full reflection.
+     *
+     * @param serverLevel ServerLevel serverLevel - The current server world.
+     * Version: 1.0.0
+     * Comments:
+     */
+    private void stopProjectilesInsideForceField(ServerLevel serverLevel) {
+
+        double centerX = this.getX();
+        double centerY = this.getY() + FORCEFIELD_BASE_Y_OFFSET;
+        double centerZ = this.getZ();
+
+        // Broad-phase box around the hemisphere
+        AABB searchBox = new AABB(
+                centerX - FORCEFIELD_RADIUS,
+                centerY,
+                centerZ - FORCEFIELD_RADIUS,
+                centerX + FORCEFIELD_RADIUS,
+                centerY + FORCEFIELD_RADIUS,
+                centerZ + FORCEFIELD_RADIUS
+        );
+
+        List<Projectile> projectiles = serverLevel.getEntitiesOfClass(Projectile.class, searchBox);
+
+        for (Projectile projectile : projectiles) {
+
+            // Skip invalid projectiles
+            if (!projectile.isAlive()) continue;
+
+            // Only affect projectiles that are actually inside the dome volume
+            if (!this.isPointInsideForceFieldDome(
+                    projectile.getX(),
+                    projectile.getY(),
+                    projectile.getZ(),
+                    centerX,
+                    centerY,
+                    centerZ
+            )) {
+                continue;
+            }
+
+            Vec3 currentVelocity = projectile.getDeltaMovement();
+
+            // If the projectile is already nearly stationary, do not keep re-bouncing it
+            if (currentVelocity.lengthSqr() < 0.0004D) continue;
+
+            // Compute outward normal from dome center to projectile position
+            Vec3 outward = new Vec3(
+                    projectile.getX() - centerX,
+                    projectile.getY() - centerY,
+                    projectile.getZ() - centerZ
+            );
+
+            // Fallback if projectile is extremely close to the exact center
+            if (outward.lengthSqr() < 0.0001D) {
+                outward = new Vec3(0.0D, 1.0D, 0.0D);
+            } else {
+                outward = outward.normalize();
+            }
+
+            // Reflect current velocity across the shield normal
+            double dot = currentVelocity.dot(outward);
+            Vec3 reflected = currentVelocity.subtract(outward.scale(2.0D * dot));
+
+            // Reduce overall speed so it feels like a shield deflection
+            reflected = reflected.scale(0.45D);
+
+            // Add a slight outward push so the projectile exits the shield cleanly
+            reflected = reflected.add(outward.scale(0.20D));
+
+            // Add a small upward lift so the projectile falls to the ground more naturally
+            reflected = new Vec3(reflected.x, Math.max(reflected.y, 0.12D), reflected.z);
+
+            // Apply the bounced velocity
+            projectile.setDeltaMovement(reflected);
+
+            // Force the client to update projectile motion immediately
+            projectile.hurtMarked = true;
+        }
+    }
+
+    /**
+     * Returns whether a point lies inside the half-sphere force field volume.
+     *
+     * @param x double x - Point X position.
+     * @param y double y - Point Y position.
+     * @param z double z - Point Z position.
+     * @param centerX double centerX - Dome center X.
+     * @param centerY double centerY - Dome base center Y.
+     * @param centerZ double centerZ - Dome center Z.
+     * @return boolean - True if the point is inside the hemisphere.
+     * Version: 1.0.0
+     * Comments:
+     */
+    private boolean isPointInsideForceFieldDome(
+            double x,
+            double y,
+            double z,
+            double centerX,
+            double centerY,
+            double centerZ
+    ) {
+
+        // Hemisphere only exists above the base plane
+        if (y < centerY) return false;
+
+        double dx = x - centerX;
+        double dy = y - centerY;
+        double dz = z - centerZ;
+
+        double distSqr = (dx * dx) + (dy * dy) + (dz * dz);
+        double radiusSqr = FORCEFIELD_RADIUS * FORCEFIELD_RADIUS;
+
+        return distSqr <= radiusSqr;
+    }
+
     /**
      * Random stroll goal that only runs when the summoner has no target.
      *
@@ -798,152 +1097,6 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
     }
 
     /**
-     * Goal that makes the summoner keep a mostly-stationary ranged spacing behavior.
-     *
-     * Behavior:
-     * - If target exists:
-     *   - If line-of-sight is blocked, move to regain LoS (repath cooldown prevents micro jitter).
-     *   - If LoS is clear:
-     *     - If too far (> 17 blocks), move toward player.
-     *     - If within 12 blocks, stop moving.
-     *     - If too close (< 8 blocks), back away slightly.
-     *
-     * This produces skeleton-like positioning without constant micro movement.
-     *
-     * Version: 1.0.0
-     * Comments:
-     */
-    private static class MaintainLineOfSightAndDistanceGoal extends Goal {
-
-        // Owning summoner
-        private final SummonerEntity summoner;
-
-        // Limits how often we issue new path requests (prevents jitter)
-        private int repathCooldownTicks = 0;
-
-        /**
-         * Constructs the maintain-LoS-and-distance goal.
-         *
-         * @param summoner SummonerEntity summoner - The summoner that will run this goal.
-         * Version: 1.0.0
-         * Comments:
-         */
-        public MaintainLineOfSightAndDistanceGoal(SummonerEntity summoner) {
-            this.summoner = summoner;
-            this.setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
-        }
-
-        /**
-         * Determines whether this goal can run.
-         *
-         * @return boolean - True when a player target exists and summoner is not casting.
-         * Version: 1.0.0
-         * Comments:
-         */
-        @Override
-        public boolean canUse() {
-            return !this.summoner.isCasting() && this.summoner.getTarget() instanceof Player;
-        }
-
-        /**
-         * Determines whether this goal should continue.
-         *
-         * @return boolean - True while the target exists and summoner is not casting.
-         * Version: 1.0.0
-         * Comments:
-         */
-        @Override
-        public boolean canContinueToUse() {
-            return this.canUse();
-        }
-
-        /**
-         * Initializes timers when the goal starts.
-         *
-         * Version: 1.0.0
-         * Comments:
-         */
-        @Override
-        public void start() {
-            this.repathCooldownTicks = 0;
-        }
-
-        /**
-         * Called every tick while the goal is active.
-         *
-         * Version: 1.0.0
-         * Comments:
-         */
-        @Override
-        public void tick() {
-
-            if (!(this.summoner.getTarget() instanceof Player target)) return;
-
-            // Decrement cooldown (prevents constant path recalculation)
-            if (this.repathCooldownTicks > 0) {
-                this.repathCooldownTicks--;
-            }
-
-            // Always face the player (even while standing still)
-            this.summoner.getLookControl().setLookAt(target, 30.0F, 30.0F);
-
-            double dist = this.summoner.distanceTo(target);
-
-            // Line-of-sight gate: if LoS is blocked, move to regain it (but not every tick)
-            boolean hasLos = this.summoner.getSensing().hasLineOfSight(target);
-            if (!hasLos) {
-
-                // Only issue a path request occasionally to avoid jitter
-                if (this.repathCooldownTicks <= 0) {
-                    this.summoner.getNavigation().moveTo(target, FOLLOW_SPEED);
-                    this.repathCooldownTicks = 20; // ~1 second
-                }
-
-                return;
-            }
-
-            // Too close: back away slightly (rarely)
-            if (dist < TOO_CLOSE_DISTANCE) {
-
-                if (this.repathCooldownTicks <= 0) {
-                    Vec3 away = this.summoner.position().subtract(target.position());
-
-                    if (away.lengthSqr() > 0.0001) {
-                        away = away.normalize();
-                        Vec3 dest = this.summoner.position().add(away.scale(4.0));
-                        this.summoner.getNavigation().moveTo(dest.x, dest.y, dest.z, FOLLOW_SPEED);
-                    }
-
-                    // Short cooldown so we don't oscillate
-                    this.repathCooldownTicks = 10;
-                }
-
-                return;
-            }
-
-            // In preferred range: stop moving completely (no micro adjustments)
-            if (dist <= FOLLOW_STOP_DISTANCE) {
-                this.summoner.getNavigation().stop();
-                return;
-            }
-
-            // Too far: only resume moving when beyond the start distance buffer
-            if (dist >= FOLLOW_START_DISTANCE) {
-
-                if (this.repathCooldownTicks <= 0) {
-                    this.summoner.getNavigation().moveTo(target, FOLLOW_SPEED);
-                    this.repathCooldownTicks = 20; // ~1 second
-                }
-
-                return;
-            }
-
-            // Buffer zone (between 12 and 17): stay still
-            this.summoner.getNavigation().stop();
-        }
-    }
-
-    /**
      * Goal that makes the summoner approach like a skeleton would, but stand still once in range.
      *
      * Differences vs vanilla Skeleton:
@@ -960,6 +1113,12 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
 
         // Tracks how long we've had LOS to the target
         private int seeTime = 0;
+
+        // Throttles how often we recalculate a path (prevents jitter)
+        private int repathCooldownTicks = 0;
+
+        // Last target position used to decide if we should repath early
+        private Vec3 lastTargetPos = Vec3.ZERO;
 
         /**
          * Constructs the goal.
@@ -1006,6 +1165,8 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
         @Override
         public void start() {
             this.seeTime = 0;
+            this.repathCooldownTicks = 0;
+            this.lastTargetPos = Vec3.ZERO;
         }
 
         /**
@@ -1019,8 +1180,31 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
 
             if (!(this.summoner.getTarget() instanceof Player target)) return;
 
-            // Always face the player
-            this.summoner.getLookControl().setLookAt(target, 30.0F, 30.0F);
+            /**
+             * Forces instant facing toward the target.
+             *
+             * IMPORTANT:
+             * - Mob rotation packets can be throttled when standing still.
+             * - Snapping yaw each tick keeps deltas large enough to send updates consistently.
+             *
+             * Version: 1.0.0
+             * Comments:
+             */
+            double dx = target.getX() - this.summoner.getX();
+            double dz = target.getZ() - this.summoner.getZ();
+
+            // Convert direction -> yaw
+            float desiredYaw = (float)(Math.atan2(dz, dx) * (180.0D / Math.PI)) - 90.0F;
+
+            // SNAP (no smoothing)
+            this.summoner.setYRot(desiredYaw);
+            this.summoner.setYHeadRot(desiredYaw);
+            this.summoner.yBodyRot = desiredYaw;
+
+            // Keep "old" rotation in sync to avoid renderer interpolation delay
+            this.summoner.yRotO = desiredYaw;
+            this.summoner.yHeadRotO = desiredYaw;
+            this.summoner.yBodyRotO = desiredYaw;
 
             // LOS tracking similar to skeleton logic
             boolean canSee = this.summoner.getSensing().hasLineOfSight(target);
@@ -1030,31 +1214,86 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
                 this.seeTime--;
             }
 
-            // Distance checks (with buffer to avoid micro movement)
-            double dist = this.summoner.distanceTo(target);
+            // Use squared distances to avoid sqrt jitter
+            double distSqr = this.summoner.distanceToSqr(target);
+
             double stopRange = SUMMONER_ATTACK_RANGE;
             double resumeRange = SUMMONER_ATTACK_RANGE + SUMMONER_ATTACK_RANGE_BUFFER;
 
+            double stopRangeSqr = stopRange * stopRange;
+            double resumeRangeSqr = resumeRange * resumeRange;
+
             // If we are within attack range AND we can see the target reliably, stand still
-            if (dist <= stopRange && this.seeTime >= 0) {
+            if (distSqr <= stopRangeSqr && this.seeTime >= 0) {
                 this.summoner.getNavigation().stop();
+                this.repathCooldownTicks = 0;
                 return;
             }
 
-            // If LOS has been broken for a while, force the summoner to keep moving to regain it
-            // (later we can improve this into a smarter LOS regain)
+            // Tick down repath cooldown
+            if (this.repathCooldownTicks > 0) {
+                this.repathCooldownTicks--;
+            }
+
+            // If LOS has been broken for a while, keep moving to regain it (but still throttle repaths)
             if (!canSee && this.seeTime < -SUMMONER_LOS_FORGET_TICKS) {
-                this.summoner.getNavigation().moveTo(target, SUMMONER_APPROACH_SPEED);
+
+                boolean shouldRepath = false;
+
+                // Repath if cooldown is done
+                if (this.repathCooldownTicks <= 0) {
+                    shouldRepath = true;
+                }
+
+                // Or if the target moved enough since last repath
+                Vec3 nowPos = target.position();
+                if (!shouldRepath && this.lastTargetPos != Vec3.ZERO) {
+                    double movedSqr = nowPos.distanceToSqr(this.lastTargetPos);
+                    double thresholdSqr = SUMMONER_REPATH_TARGET_MOVE_THRESHOLD * SUMMONER_REPATH_TARGET_MOVE_THRESHOLD;
+                    if (movedSqr >= thresholdSqr) {
+                        shouldRepath = true;
+                    }
+                }
+
+                if (shouldRepath) {
+                    this.summoner.getNavigation().moveTo(target, SUMMONER_APPROACH_SPEED);
+                    this.repathCooldownTicks = SUMMONER_REPATH_INTERVAL_TICKS;
+                    this.lastTargetPos = nowPos;
+                }
+
                 return;
             }
 
-            // If outside resume range, approach target
-            if (dist >= resumeRange) {
-                this.summoner.getNavigation().moveTo(target, SUMMONER_APPROACH_SPEED);
+            // If outside resume range, approach target (throttled)
+            if (distSqr >= resumeRangeSqr) {
+
+                boolean shouldRepath = false;
+
+                if (this.repathCooldownTicks <= 0) {
+                    shouldRepath = true;
+                }
+
+                Vec3 nowPos = target.position();
+                if (!shouldRepath && this.lastTargetPos != Vec3.ZERO) {
+                    double movedSqr = nowPos.distanceToSqr(this.lastTargetPos);
+                    double thresholdSqr = SUMMONER_REPATH_TARGET_MOVE_THRESHOLD * SUMMONER_REPATH_TARGET_MOVE_THRESHOLD;
+                    if (movedSqr >= thresholdSqr) {
+                        shouldRepath = true;
+                    }
+                }
+
+                if (shouldRepath) {
+                    this.summoner.getNavigation().moveTo(target, SUMMONER_APPROACH_SPEED);
+                    this.repathCooldownTicks = SUMMONER_REPATH_INTERVAL_TICKS;
+                    this.lastTargetPos = nowPos;
+                }
+
             } else {
                 // Inside the buffer zone: do nothing (prevents jitter)
                 this.summoner.getNavigation().stop();
+                this.repathCooldownTicks = 0;
             }
+            
         }
 
         /**
