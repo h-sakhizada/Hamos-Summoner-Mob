@@ -554,8 +554,9 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
      * Starts the summoning sequence and spawns 6 rising minions.
      *
      * Spawns:
-     * - 4 zombies
+     * - 3 zombies
      * - 2 bodyguards
+     * - 1 stalker
      *
      * Version: 1.0.0
      * Comments:
@@ -579,12 +580,18 @@ public class SummonerEntity extends Skeleton implements GeoEntity {
             double startY = this.getY() - RISE_DEPTH;
             double endY = this.getY();
 
-            // Choose which indices become bodyguards (2 of 6)
+            // Choose which indices become bodyguards (2 of 6) and stalker (1 of 6)
+            boolean isStalker = (i == 0);
             boolean isBodyguard = (i == 2 || i == 4);
 
-            Zombie mob = isBodyguard
-                    ? ModEntities.BODYGUARD.get().create(serverLevel)
-                    : EntityType.ZOMBIE.create(serverLevel);
+            Zombie mob;
+            if (isStalker) {
+                mob = ModEntities.STALKER.get().create(serverLevel);
+            } else if (isBodyguard) {
+                mob = ModEntities.BODYGUARD.get().create(serverLevel);
+            } else {
+                mob = EntityType.ZOMBIE.create(serverLevel);
+            }
 
             if (mob == null) continue;
 

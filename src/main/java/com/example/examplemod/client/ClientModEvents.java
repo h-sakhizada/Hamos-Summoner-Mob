@@ -2,6 +2,7 @@ package com.example.examplemod.client;
 
 import com.example.examplemod.ExampleMod;
 import com.example.examplemod.client.renderer.BodyguardRenderer;
+import com.example.examplemod.client.renderer.StalkerRenderer;
 import com.example.examplemod.client.renderer.SummonerRenderer;
 
 import com.example.examplemod.registry.ModEntities;
@@ -36,6 +37,9 @@ public class ClientModEvents {
 
         // Register the SummonerEntity renderer
         event.registerEntityRenderer(ModEntities.SUMMONER.get(), SummonerRenderer::new);
+
+        // Register the StalkerEntity renderer
+        event.registerEntityRenderer(ModEntities.STALKER.get(), StalkerRenderer::new);
 
         // Register the BodyguardEntity renderer
         event.registerEntityRenderer(

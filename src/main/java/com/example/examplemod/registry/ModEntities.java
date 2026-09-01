@@ -2,6 +2,7 @@ package com.example.examplemod.registry;
 
 import com.example.examplemod.ExampleMod;
 import com.example.examplemod.entity.BodyguardEntity;
+import com.example.examplemod.entity.StalkerEntity;
 import com.example.examplemod.entity.SummonerEntity;
 
 import net.minecraft.resources.ResourceLocation;
@@ -38,6 +39,24 @@ public class ModEntities {
                             .build(
                                     ResourceLocation
                                             .fromNamespaceAndPath(ExampleMod.MODID, "summoner")
+                                            .toString()
+                            )
+            );
+
+    // Registry entry for the Stalker entity type
+    public static final RegistryObject<EntityType<StalkerEntity>> STALKER =
+            ENTITY_TYPES.register("stalker",
+                    () -> EntityType.Builder
+                            // Binds the StalkerEntity constructor to this entity type
+                            .of(StalkerEntity::new, MobCategory.MONSTER)
+
+                            // Baby-zombie-sized collision box (small and short)
+                            .sized(0.4f, 1.0f)
+
+                            // Builds the entity type using the modern, non-deprecated ResourceLocation API
+                            .build(
+                                    ResourceLocation
+                                            .fromNamespaceAndPath(ExampleMod.MODID, "stalker")
                                             .toString()
                             )
             );

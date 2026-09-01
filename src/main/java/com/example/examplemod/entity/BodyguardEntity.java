@@ -1273,6 +1273,7 @@ public class BodyguardEntity extends Zombie implements GeoEntity {
          */
         public StayBesideSummonerGoal(BodyguardEntity guard) {
             this.guard = guard;
+
             this.setFlags(EnumSet.of(Flag.MOVE, Flag.LOOK));
         }
 

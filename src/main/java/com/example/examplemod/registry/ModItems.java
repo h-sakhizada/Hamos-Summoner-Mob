@@ -33,6 +33,18 @@ public class ModItems {
                     )
             );
 
+    // Spawn egg item for the Stalker entity (colors are placeholder values)
+    public static final RegistryObject<Item> STALKER_SPAWN_EGG =
+            ITEMS.register(
+                    "stalker_spawn_egg",
+                    () -> new ForgeSpawnEggItem(
+                            ModEntities.STALKER,
+                            0x1A1A1A, // Primary egg color (dark)
+                            0x4A0E0E, // Secondary egg color (dark red)
+                            new Item.Properties()
+                    )
+            );
+
     // Spawn egg item for the Bodyguard entity (colors are placeholder values)
     public static final RegistryObject<Item> BODYGUARD_SPAWN_EGG =
             ITEMS.register(
